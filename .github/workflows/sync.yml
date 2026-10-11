@@ -1,40 +1,68 @@
-name: Upstream Sync
+name: Sync upstream
+
+on:
+  schedule:
+    - cron: '17 0 * * *'
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/sync.yml']
 
 permissions:
   contents: write
 
-on:
-  schedule:
-    - cron: "0 0 * * *" # every day
-  workflow_dispatch:
+concurrency:
+  group: sync-upstream-main
+  cancel-in-progress: false
 
 jobs:
-  sync_latest_from_upstream:
-    name: Sync latest commits from upstream repo
+  sync:
+    if: github.repository == 'lkdd20/CF-Server-Monitor'
     runs-on: ubuntu-latest
-    if: ${{ github.event.repository.fork }}
-
+    timeout-minutes: 10
     steps:
-      # Step 1: run a standard checkout action
-      - name: Checkout target repo
-        uses: actions/checkout@v3
-
-      # Step 2: run the sync action
-      - name: Sync upstream changes
-        id: sync
-        uses: aormsby/Fork-Sync-With-Upstream-action@v3.4
-        with:
-          upstream_sync_repo: huilang-me/CF-Server-Monitor
-          upstream_sync_branch: main
-          target_sync_branch: main
-          target_repo_token: ${{ secrets.GITHUB_TOKEN }} # automatically generated, no need to set
-
-          # Set test_mode true to run tests instead of the true action!!
-          test_mode: false
-
-      - name: Sync check
-        if: failure()
+      - name: Merge upstream and preserve fork changes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          UPSTREAM_REPOSITORY: huilang-me/CF-Server-Monitor
+          DEFAULT_BRANCH: main
+          UPSTREAM_BRANCH: main
+          GIT_TERMINAL_PROMPT: '0'
+        shell: bash
         run: |
-          echo "[Error] 由于上游仓库的 workflow 文件变更，导致 GitHub 自动暂停了本次自动更新，请前往仓库页面手动执行 Sync Fork 操作。"
-          echo "[Error] Due to a change in the workflow file of the upstream repository, GitHub has automatically suspended the scheduled automatic update. You need to manually sync your fork."
-          exit 1
+          set -euo pipefail
+          gh auth setup-git --hostname github.com
+          workdir="$(mktemp -d "$RUNNER_TEMP/fork-sync.XXXXXX")"
+          git clone --no-tags --single-branch --branch "$DEFAULT_BRANCH" "https://github.com/$REPOSITORY.git" "$workdir"
+          cd "$workdir"
+          git remote add upstream "https://github.com/$UPSTREAM_REPOSITORY.git"
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git fetch --no-tags upstream "$UPSTREAM_BRANCH"
+          if git merge-base --is-ancestor FETCH_HEAD HEAD; then
+            echo 'Default branch already contains upstream.'
+            exit 0
+          fi
+          set +e
+          git -c core.hooksPath=/dev/null merge --no-commit --no-ff FETCH_HEAD
+          merge_status=$?
+          set -e
+          if ! git rev-parse -q --verify MERGE_HEAD >/dev/null; then
+            echo "Unable to start upstream merge (status $merge_status)." >&2
+            exit 1
+          fi
+          # Keep fork workflows because GITHUB_TOKEN cannot update workflow files.
+          git rm -r -f --ignore-unmatch .github/workflows >/dev/null
+          git restore --source=HEAD --staged --worktree -- .github/workflows
+          # Inspect unresolved conflicts before staging, which would mark them resolved.
+          unresolved="$(git diff --name-only --diff-filter=U)"
+          if [[ -n "$unresolved" ]]; then
+            printf 'Upstream conflicts require review:\n%s\n' "$unresolved" >&2
+            git merge --abort
+            exit 1
+          fi
+          git add -A
+          git -c core.hooksPath=/dev/null commit -m 'chore: sync upstream (preserve fork workflows)'
+          git push origin "HEAD:$DEFAULT_BRANCH"
